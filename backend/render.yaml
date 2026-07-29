@@ -1,0 +1,53 @@
+# Render deployment blueprint for BookScan backend.
+# Deploy: connect your GitHub repo in the Render dashboard and point it at this file.
+#
+# Tesseract OCR note:
+# Render's native Python environment does not support aptPackages in render.yaml.
+# To install Tesseract, add a build script or use a Docker runtime.
+# Option A (Docker): switch to `type: web` with `image: ...` pointing at a
+#   Dockerfile that runs `apt-get install -y tesseract-ocr`.
+# Option B (buildCommand): call a setup script:
+#   buildCommand: "apt-get install -y tesseract-ocr || true && pip install -r requirements.txt"
+#   This works on Render's Linux build image when run as root.
+
+services:
+  - type: web
+    name: bookscan-api
+    runtime: python
+    region: oregon
+    plan: starter
+
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "uvicorn main:app --host 0.0.0.0 --port $PORT"
+
+    # Root directory of the service within your repo
+    rootDir: backend
+
+    healthCheckPath: /health
+
+    envVars:
+      # Supabase — mark sync:false so Render does not expose values in logs.
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_KEY
+        sync: false
+
+      # CORS — comma-separated list of allowed frontend origins.
+      # Example: https://bookscan.vercel.app,https://www.bookscan.io
+      - key: ALLOWED_ORIGINS
+        sync: false
+
+      # Optional: Render provides PORT automatically; set a fallback for local dev.
+      - key: PORT
+        value: "8000"
+
+      # Python path so uvicorn can locate the app module.
+      - key: PYTHONPATH
+        value: "."
+
+    # Autoscaling (Render Starter does not support this; uncomment on paid plans)
+    # autoscaling:
+    #   minInstances: 1
+    #   maxInstances: 3
+    #   targetMemoryPercent: 80
+    #   targetCPUPercent: 70
