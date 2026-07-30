@@ -1,71 +1,106 @@
 """
-BookScan — Supabase client setup.
-Degrades gracefully when credentials are absent so the app can boot on Render
-before environment variables are configured.
+BookScan — SQLAlchemy 2.0 async database layer (asyncpg + Neon PostgreSQL).
+Degrades gracefully when DATABASE_URL is absent so the app can boot on a fresh
+host before environment variables are configured.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+from collections.abc import AsyncIterator
+
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import (
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Module-level client — may be None when Supabase is not configured.
+# Module-level state
 # ---------------------------------------------------------------------------
-_supabase_client = None
-_supabase_configured = False
+
+_engine = None
+_session_factory: async_sessionmaker[AsyncSession] | None = None
+_configured = False
 
 
-def _init_client() -> None:
-    """Attempt to initialise the Supabase client once at import time."""
-    global _supabase_client, _supabase_configured  # noqa: PLW0603
-
-    url = os.environ.get("SUPABASE_URL", "").strip()
-    key = os.environ.get("SUPABASE_SERVICE_KEY", "").strip()
-
-    if not url or not key:
-        logger.warning(
-            "SUPABASE_URL or SUPABASE_SERVICE_KEY not set — "
-            "running in unconfigured mode; DB-backed routes will return 503."
-        )
-        return
-
-    try:
-        from supabase import create_client  # lazy import
-
-        _supabase_client = create_client(url, key)
-        _supabase_configured = True
-        logger.info("Supabase client initialised successfully.")
-    except Exception as exc:
-        logger.exception("Failed to initialise Supabase client: %s", exc)
-
-
-# Run once on module load.
-_init_client()
-
-
-def get_client():
-    """
-    Return the Supabase client, or raise RuntimeError when not configured.
-    Callers should convert RuntimeError to HTTPException 503.
-    """
-    if _supabase_client is None:
-        raise RuntimeError("Supabase is not configured.")
-    return _supabase_client
+# ---------------------------------------------------------------------------
+# Public helpers
+# ---------------------------------------------------------------------------
 
 
 def is_configured() -> bool:
-    """Return True when Supabase credentials are present and the client is live."""
-    return _supabase_configured
+    """Return True when DATABASE_URL was set and the engine initialised."""
+    return _configured
 
 
-def require_db():
-    """
-    Call this at the top of any endpoint that needs the database.
-    Raises RuntimeError (caller catches and converts to 503).
-    """
-    if not _supabase_configured:
-        raise RuntimeError("Supabase is not configured.")
-    return _supabase_client
+async def get_session() -> AsyncIterator[AsyncSession]:
+    """FastAPI ``Depends()``-compatible async generator that yields a session."""
+    if _session_factory is None:
+        raise RuntimeError("Database is not configured.")
+    async with _session_factory() as session:
+        yield session
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle hooks (called from the FastAPI lifespan)
+# ---------------------------------------------------------------------------
+
+
+async def startup() -> None:
+    """Create the async engine and verify the connection."""
+    global _engine, _session_factory, _configured  # noqa: PLW0603
+
+    raw_url = os.environ.get("DATABASE_URL", "").strip()
+    if not raw_url:
+        logger.warning(
+            "DATABASE_URL not set — running in unconfigured mode; "
+            "DB-backed routes will return 503."
+        )
+        return
+
+    # Normalise the scheme for asyncpg
+    if raw_url.startswith("postgresql://"):
+        dsn = raw_url.replace("postgresql://", "postgresql+asyncpg://", 1)
+    elif raw_url.startswith("postgres://"):
+        dsn = raw_url.replace("postgres://", "postgresql+asyncpg://", 1)
+    else:
+        dsn = raw_url
+
+    _engine = create_async_engine(
+        dsn,
+        pool_size=5,
+        max_overflow=10,
+        pool_pre_ping=True,
+    )
+    _session_factory = async_sessionmaker(
+        _engine,
+        class_=AsyncSession,
+        expire_on_commit=False,
+    )
+
+    # Connection test
+    try:
+        async with _engine.begin() as conn:
+            await conn.execute(text("SELECT 1"))
+        _configured = True
+        logger.info("Database connection established successfully.")
+    except Exception as exc:
+        logger.exception("Failed to connect to the database: %s", exc)
+        _engine = None
+        _session_factory = None
+
+
+async def shutdown() -> None:
+    """Dispose of the engine connection pool."""
+    global _engine, _session_factory, _configured  # noqa: PLW0603
+    if _engine is not None:
+        await _engine.dispose()
+        _engine = None
+        _session_factory = None
+        _configured = False
+        logger.info("Database engine disposed.")

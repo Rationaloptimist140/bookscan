@@ -134,10 +134,6 @@ export default function SettingsPage() {
   }
 
   const backendUrl = process.env.NEXT_PUBLIC_API_URL ?? '';
-  const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL ?? '';
-  // Note: NEXT_PUBLIC_SUPABASE_ANON_KEY must be public by design (anon key);
-  // the service_role key must NEVER be in NEXT_PUBLIC_ and is never shown here.
-  const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ?? '';
 
   return (
     <PageContainer max="md">
@@ -191,15 +187,9 @@ export default function SettingsPage() {
               </code>
             </div>
             <div>
-              <p className="text-xs font-body text-ink-muted mb-1">Supabase URL</p>
+              <p className="text-xs font-body text-ink-muted mb-1">Database</p>
               <code className="block text-xs font-mono px-3 py-2 bg-canvas-alt rounded-md text-ink-body border border-rule break-all">
-                {supabaseUrl ? maskValue(supabaseUrl) : '(not configured)'}
-              </code>
-            </div>
-            <div>
-              <p className="text-xs font-body text-ink-muted mb-1">Supabase Anon Key</p>
-              <code className="block text-xs font-mono px-3 py-2 bg-canvas-alt rounded-md text-ink-body border border-rule break-all">
-                {supabaseAnonKey ? maskValue(supabaseAnonKey) : '(not configured)'}
+                Neon PostgreSQL (configured server-side)
               </code>
             </div>
           </div>

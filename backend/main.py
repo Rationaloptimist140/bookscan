@@ -10,18 +10,26 @@ import io
 import json
 import logging
 import os
-from datetime import datetime
-
-try:
-    from datetime import UTC
-except ImportError:
-    import datetime as _dt_mod
-    UTC = _dt_mod.timezone.utc  # type: ignore[assignment]
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
-from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Query, UploadFile
+from fastapi import (
+    BackgroundTasks,
+    Depends,
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    UploadFile,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse, StreamingResponse
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
 
 import database
 import external_apis
@@ -66,16 +74,26 @@ logger = logging.getLogger(__name__)
 
 VERSION = "1.0.0"
 
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    await database.startup()
+    yield
+    await database.shutdown()
+
+
 app = FastAPI(
     title="BookScan API",
     version=VERSION,
     description="Backend for triaging, scanning, and selling pre-2022 books as AI training data.",
+    lifespan=lifespan,
 )
 
 # CORS
 _raw_origins = os.environ.get("ALLOWED_ORIGINS", "*")
 origins: list[str] = (
-    ["*"] if _raw_origins.strip() == "*"
+    ["*"]
+    if _raw_origins.strip() == "*"
     else [o.strip() for o in _raw_origins.split(",") if o.strip()]
 )
 
@@ -89,22 +107,28 @@ app.add_middleware(
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Dependency
 # ---------------------------------------------------------------------------
 
 
-def _db_or_503():
-    """Return Supabase client or raise 503."""
-    try:
-        return database.require_db()
-    except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
+async def get_db(
+    session: AsyncSession = Depends(database.get_session),
+) -> AsyncSession:
+    """Wrap ``database.get_session`` so RuntimeError becomes HTTP 503."""
+    return session
 
 
-def _row_or_404(data: list[dict[str, Any]], entity: str, entity_id: str) -> dict[str, Any]:
-    if not data:
-        raise HTTPException(status_code=404, detail=f"{entity} {entity_id} not found")
-    return data[0]
+@app.exception_handler(RuntimeError)
+async def _runtime_error_handler(request: Any, exc: RuntimeError) -> Any:
+    """Convert RuntimeError raised by get_session into 503."""
+    from fastapi.responses import JSONResponse
+
+    return JSONResponse(status_code=503, content={"detail": str(exc)})
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 
 def _now_iso() -> str:
@@ -112,7 +136,7 @@ def _now_iso() -> str:
 
 
 def _coerce_book(row: dict[str, Any]) -> Book:
-    """Convert raw Supabase row to Book model, coercing array nulls."""
+    """Convert raw DB row to Book model, coercing array nulls."""
     row.setdefault("subject_keywords", [])
     row.setdefault("ai_value_factors", [])
     row.setdefault("provenance_chain", [])
@@ -126,6 +150,20 @@ def _coerce_book(row: dict[str, Any]) -> Book:
 
 
 # ---------------------------------------------------------------------------
+# Storage helper
+# ---------------------------------------------------------------------------
+
+STORAGE_DIR = os.environ.get("STORAGE_DIR", "./storage")
+
+
+def _storage_path(*parts: str) -> Path:
+    """Build an absolute path under STORAGE_DIR and ensure parent dirs exist."""
+    p = Path(STORAGE_DIR).joinpath(*parts)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+# ---------------------------------------------------------------------------
 # Health check
 # ---------------------------------------------------------------------------
 
@@ -136,7 +174,7 @@ async def health_check() -> HealthResponse:
     return HealthResponse(
         status="ok",
         version=VERSION,
-        supabase_configured=database.is_configured(),
+        db_configured=database.is_configured(),
     )
 
 
@@ -146,34 +184,42 @@ async def health_check() -> HealthResponse:
 
 
 @app.get("/api/stats/summary", response_model=StatsSummary, tags=["stats"])
-async def get_stats_summary() -> StatsSummary:
-    db = _db_or_503()
+async def get_stats_summary(
+    session: AsyncSession = Depends(get_db),
+) -> StatsSummary:
+    total_books = (
+        await session.execute(text("SELECT count(*) FROM books"))
+    ).scalar_one()
 
-    total_resp = db.table("books").select("id", count="exact").execute()
-    total_books = total_resp.count or 0
+    pd_books = (
+        await session.execute(
+            text(
+                "SELECT count(*) FROM books "
+                "WHERE public_domain_status = ANY(:statuses)"
+            ),
+            {"statuses": ["confirmed_pd", "likely_pd"]},
+        )
+    ).scalar_one()
 
-    pd_resp = (
-        db.table("books")
-        .select("id", count="exact")
-        .in_("public_domain_status", ["confirmed_pd", "likely_pd"])
-        .execute()
-    )
-    pd_books = pd_resp.count or 0
-
-    ready_resp = (
-        db.table("books")
-        .select("id", count="exact")
-        .eq("triage_action", "scan_and_sell_data")
-        .execute()
-    )
-    ready_to_scan = ready_resp.count or 0
+    ready_to_scan = (
+        await session.execute(
+            text(
+                "SELECT count(*) FROM books "
+                "WHERE triage_action = 'scan_and_sell_data'"
+            )
+        )
+    ).scalar_one()
 
     # Revenue from sales table
-    sales_resp = db.table("sales").select("final_price,asking_price,sale_type").eq("status", "sold").execute()
-    sales_rows = sales_resp.data or []
+    sales_result = await session.execute(
+        text(
+            "SELECT final_price, asking_price, sale_type FROM sales "
+            "WHERE status = 'sold'"
+        )
+    )
     data_revenue = 0.0
     physical_revenue = 0.0
-    for s in sales_rows:
+    for s in sales_result.mappings().all():
         amount = float(s.get("final_price") or s.get("asking_price") or 0)
         if s.get("sale_type") == "data":
             data_revenue += amount
@@ -182,16 +228,20 @@ async def get_stats_summary() -> StatsSummary:
     total_revenue = data_revenue + physical_revenue
 
     # Acquisition cost
-    cost_resp = db.table("books").select("acquisition_cost").execute()
-    total_cost = sum(float(r.get("acquisition_cost") or 0) for r in (cost_resp.data or []))
-
-    datasets_resp = db.table("datasets").select("id", count="exact").execute()
-    datasets_count = datasets_resp.count or 0
-
-    datasets_sold_resp = (
-        db.table("datasets").select("id", count="exact").eq("sale_status", "sold").execute()
+    cost_result = await session.execute(
+        text("SELECT COALESCE(sum(acquisition_cost), 0) FROM books")
     )
-    datasets_sold = datasets_sold_resp.count or 0
+    total_cost = float(cost_result.scalar_one())
+
+    datasets_count = (
+        await session.execute(text("SELECT count(*) FROM datasets"))
+    ).scalar_one()
+
+    datasets_sold = (
+        await session.execute(
+            text("SELECT count(*) FROM datasets WHERE sale_status = 'sold'")
+        )
+    ).scalar_one()
 
     pd_pct = round((pd_books / total_books * 100) if total_books else 0, 1)
 
@@ -210,11 +260,16 @@ async def get_stats_summary() -> StatsSummary:
     )
 
 
-@app.get("/api/stats/triage-distribution", response_model=list[TriageDistributionSlice], tags=["stats"])
-async def get_triage_distribution() -> list[TriageDistributionSlice]:
-    db = _db_or_503()
-    resp = db.table("books").select("triage_action").execute()
-    rows = resp.data or []
+@app.get(
+    "/api/stats/triage-distribution",
+    response_model=list[TriageDistributionSlice],
+    tags=["stats"],
+)
+async def get_triage_distribution(
+    session: AsyncSession = Depends(get_db),
+) -> list[TriageDistributionSlice]:
+    result = await session.execute(text("SELECT triage_action FROM books"))
+    rows = result.mappings().all()
 
     action_labels = {
         "scan_and_sell_data": "Scan & Sell Data",
@@ -241,19 +296,21 @@ async def get_triage_distribution() -> list[TriageDistributionSlice]:
 
 
 @app.get("/api/activity", response_model=list[ActivityEntry], tags=["stats"])
-async def get_activity(limit: int = Query(default=20, ge=1, le=100)) -> list[ActivityEntry]:
-    db = _db_or_503()
+async def get_activity(
+    limit: int = Query(default=20, ge=1, le=100),
+    session: AsyncSession = Depends(get_db),
+) -> list[ActivityEntry]:
     entries: list[ActivityEntry] = []
 
     # Recent books added
-    books_resp = (
-        db.table("books")
-        .select("id,title,author_name,created_at,triage_score")
-        .order("created_at", desc=True)
-        .limit(limit)
-        .execute()
+    books_result = await session.execute(
+        text(
+            "SELECT id, title, author_name, created_at, triage_score "
+            "FROM books ORDER BY created_at DESC LIMIT :lim"
+        ),
+        {"lim": limit},
     )
-    for b in books_resp.data or []:
+    for b in books_result.mappings().all():
         entries.append(
             ActivityEntry(
                 id=b["id"],
@@ -266,15 +323,16 @@ async def get_activity(limit: int = Query(default=20, ge=1, le=100)) -> list[Act
         )
 
     # Recent sales
-    sales_resp = (
-        db.table("sales")
-        .select("id,platform,final_price,asking_price,sale_type,sold_at,created_at,book_id")
-        .eq("status", "sold")
-        .order("sold_at", desc=True)
-        .limit(limit)
-        .execute()
+    sales_result = await session.execute(
+        text(
+            "SELECT id, platform, final_price, asking_price, sale_type, "
+            "sold_at, created_at, book_id "
+            "FROM sales WHERE status = 'sold' "
+            "ORDER BY sold_at DESC NULLS LAST LIMIT :lim"
+        ),
+        {"lim": limit},
     )
-    for s in sales_resp.data or []:
+    for s in sales_result.mappings().all():
         amount = float(s.get("final_price") or s.get("asking_price") or 0)
         kind = "dataset_sold" if s.get("sale_type") == "data" else "book_sold"
         entries.append(
@@ -289,20 +347,24 @@ async def get_activity(limit: int = Query(default=20, ge=1, le=100)) -> list[Act
         )
 
     # Recent datasets created
-    ds_resp = (
-        db.table("datasets")
-        .select("id,title,created_at,word_count")
-        .order("created_at", desc=True)
-        .limit(limit)
-        .execute()
+    ds_result = await session.execute(
+        text(
+            "SELECT id, title, created_at, word_count "
+            "FROM datasets ORDER BY created_at DESC LIMIT :lim"
+        ),
+        {"lim": limit},
     )
-    for d in ds_resp.data or []:
+    for d in ds_result.mappings().all():
         entries.append(
             ActivityEntry(
                 id=d["id"],
                 kind="dataset_created",
                 title=d["title"],
-                detail=f"{d.get('word_count') or 0:,} words" if d.get("word_count") else None,
+                detail=(
+                    f"{d.get('word_count') or 0:,} words"
+                    if d.get("word_count")
+                    else None
+                ),
                 amount=None,
                 timestamp=d["created_at"],
             )
@@ -333,25 +395,47 @@ async def _run_triage(
     if isbn:
         normalised_isbn = triage_logic.normalise_isbn(isbn)
         if not triage_logic.validate_isbn(normalised_isbn):
-            warnings.append(f"ISBN {normalised_isbn} failed checksum validation — proceeding anyway.")
+            warnings.append(
+                f"ISBN {normalised_isbn} failed checksum validation "
+                "-- proceeding anyway."
+            )
 
     # Check triage cache
     if db_configured:
         try:
-            db = database.get_client()
-            cache_q = db.table("triage_cache").select("*")
-            if normalised_isbn:
-                cache_q = cache_q.eq("isbn", normalised_isbn)
-            elif title:
-                cache_q = cache_q.eq("title", title)
-                if author:
-                    cache_q = cache_q.eq("author", author)
-            cache_q = cache_q.gte("expires_at", now_str).limit(1)
-            cache_resp = cache_q.execute()
-            if cache_resp.data:
-                cached_result = TriageResult(**cache_resp.data[0]["result"])
-                cached_result.cached = True
-                return cached_result
+            async for session in database.get_session():
+                conditions: list[str] = []
+                params: dict[str, Any] = {"now": now_str}
+
+                if normalised_isbn:
+                    conditions.append("isbn = :isbn")
+                    params["isbn"] = normalised_isbn
+                elif title:
+                    conditions.append("title = :title")
+                    params["title"] = title
+                    if author:
+                        conditions.append("author = :author")
+                        params["author"] = author
+
+                if conditions:
+                    where = " AND ".join(conditions)
+                    cache_result = await session.execute(
+                        text(
+                            "SELECT * FROM triage_cache "
+                            f"WHERE {where} AND expires_at >= :now "
+                            "LIMIT 1"
+                        ),
+                        params,
+                    )
+                    cache_row = cache_result.mappings().first()
+                    if cache_row:
+                        result_data = cache_row["result"]
+                        if isinstance(result_data, str):
+                            result_data = json.loads(result_data)
+                        cached_result = TriageResult(**result_data)
+                        cached_result.cached = True
+                        return cached_result
+                break
         except Exception as exc:
             warnings.append(f"Cache lookup failed: {exc}")
 
@@ -367,7 +451,9 @@ async def _run_triage(
             book_data = ol_data
             author_key = ol_data.get("author_key")
     elif title:
-        ol_data, warn = await external_apis.search_open_library(title=title, author=author)
+        ol_data, warn = await external_apis.search_open_library(
+            title=title, author=author
+        )
         if warn:
             warnings.append(warn)
         if ol_data:
@@ -386,15 +472,9 @@ async def _run_triage(
             author_death_year = author_detail.get("death_year")
 
     # Build working values
-    resolved_title: str = (
-        book_data.get("title")
-        or title
-        or "Unknown Title"
-    )
+    resolved_title: str = book_data.get("title") or title or "Unknown Title"
     resolved_author: str = (
-        (book_data.get("authors") or [None])[0]
-        or author
-        or "Unknown Author"
+        (book_data.get("authors") or [None])[0] or author or "Unknown Author"
     )
     publish_year: int | None = (
         book_data.get("first_publish_year")
@@ -405,6 +485,7 @@ async def _run_triage(
     # Fallback: parse year from publish_date string
     if publish_year is None and book_data.get("publish_date"):
         import re as _re
+
         m = _re.search(r"\b(\d{4})\b", str(book_data["publish_date"]))
         if m:
             publish_year = int(m.group(1))
@@ -426,18 +507,33 @@ async def _run_triage(
     if gb_result:
         gutenberg_data = gb_result
 
-    already_digitised: bool = gutenberg_data is not None and gutenberg_data.get("already_digitised", False)
-    gutenberg_id: int | None = gutenberg_data.get("gutenberg_id") if gutenberg_data else None
-    gutenberg_url: str | None = gutenberg_data.get("gutenberg_url") if gutenberg_data else None
+    already_digitised: bool = (
+        gutenberg_data is not None
+        and gutenberg_data.get("already_digitised", False)
+    )
+    gutenberg_id: int | None = (
+        gutenberg_data.get("gutenberg_id") if gutenberg_data else None
+    )
+    gutenberg_url: str | None = (
+        gutenberg_data.get("gutenberg_url") if gutenberg_data else None
+    )
 
     # Business logic
-    pd_status, pd_reason = triage_logic.determine_public_domain(publish_year, author_death_year)
+    pd_status, pd_reason = triage_logic.determine_public_domain(
+        publish_year, author_death_year
+    )
     ai_value, ai_factors, pre_llm = triage_logic.assess_ai_value(
         publish_year, already_digitised, pd_status, subjects
     )
-    triage_score = triage_logic.calculate_triage_score(ai_value, pd_status, already_digitised, pre_llm)
-    triage_action = triage_logic.determine_triage_action(ai_value, pd_status, already_digitised)
-    resale_rec_dict = triage_logic.recommend_resale_platform(pd_status, ai_value, already_digitised)
+    triage_score = triage_logic.calculate_triage_score(
+        ai_value, pd_status, already_digitised, pre_llm
+    )
+    triage_action = triage_logic.determine_triage_action(
+        ai_value, pd_status, already_digitised
+    )
+    resale_rec_dict = triage_logic.recommend_resale_platform(
+        pd_status, ai_value, already_digitised
+    )
 
     result = TriageResult(
         isbn=normalised_isbn,
@@ -474,14 +570,21 @@ async def _run_triage(
     # Write to cache (best-effort)
     if db_configured:
         try:
-            db = database.get_client()
-            cache_row: dict[str, Any] = {
-                "isbn": normalised_isbn,
-                "title": resolved_title,
-                "author": resolved_author,
-                "result": result.model_dump(mode="json"),
-            }
-            db.table("triage_cache").insert(cache_row).execute()
+            async for session in database.get_session():
+                await session.execute(
+                    text(
+                        "INSERT INTO triage_cache (isbn, title, author, result) "
+                        "VALUES (:isbn, :title, :author, :result)"
+                    ),
+                    {
+                        "isbn": normalised_isbn,
+                        "title": resolved_title,
+                        "author": resolved_author,
+                        "result": json.dumps(result.model_dump(mode="json")),
+                    },
+                )
+                await session.commit()
+                break
         except Exception as exc:
             logger.warning("Failed to write triage cache: %s", exc)
 
@@ -491,37 +594,63 @@ async def _run_triage(
 @app.post("/api/triage", response_model=TriageResult, tags=["triage"])
 async def triage_book(payload: TriageRequest) -> TriageResult:
     if not payload.isbn and not payload.title:
-        raise HTTPException(status_code=422, detail="Provide isbn or title to run triage.")
+        raise HTTPException(
+            status_code=422, detail="Provide isbn or title to run triage."
+        )
     return await _run_triage(payload.isbn, payload.title, payload.author)
 
 
-@app.post("/api/triage/bulk", response_model=list[BulkTriageResultRow], tags=["triage"])
-async def triage_bulk(payload: BulkTriageRequest) -> list[BulkTriageResultRow]:
+@app.post(
+    "/api/triage/bulk",
+    response_model=list[BulkTriageResultRow],
+    tags=["triage"],
+)
+async def triage_bulk(
+    payload: BulkTriageRequest,
+) -> list[BulkTriageResultRow]:
     if not payload.isbns:
-        raise HTTPException(status_code=422, detail="isbns list must not be empty.")
+        raise HTTPException(
+            status_code=422, detail="isbns list must not be empty."
+        )
     results: list[BulkTriageResultRow] = []
     for raw_isbn in payload.isbns:
         try:
             result = await _run_triage(raw_isbn, None, None)
-            results.append(BulkTriageResultRow(isbn=raw_isbn, ok=True, error=None, result=result))
+            results.append(
+                BulkTriageResultRow(
+                    isbn=raw_isbn, ok=True, error=None, result=result
+                )
+            )
         except Exception as exc:
-            results.append(BulkTriageResultRow(isbn=raw_isbn, ok=False, error=str(exc), result=None))
+            results.append(
+                BulkTriageResultRow(
+                    isbn=raw_isbn, ok=False, error=str(exc), result=None
+                )
+            )
     return results
 
 
-@app.get("/api/triage/history", response_model=list[TriageHistoryEntry], tags=["triage"])
-async def triage_history(limit: int = Query(default=50, ge=1, le=200)) -> list[TriageHistoryEntry]:
-    db = _db_or_503()
-    resp = (
-        db.table("triage_cache")
-        .select("id,isbn,title,author,result,created_at")
-        .order("created_at", desc=True)
-        .limit(limit)
-        .execute()
+@app.get(
+    "/api/triage/history",
+    response_model=list[TriageHistoryEntry],
+    tags=["triage"],
+)
+async def triage_history(
+    limit: int = Query(default=50, ge=1, le=200),
+    session: AsyncSession = Depends(get_db),
+) -> list[TriageHistoryEntry]:
+    result = await session.execute(
+        text(
+            "SELECT id, isbn, title, author, result, created_at "
+            "FROM triage_cache ORDER BY created_at DESC LIMIT :lim"
+        ),
+        {"lim": limit},
     )
     entries: list[TriageHistoryEntry] = []
-    for row in resp.data or []:
+    for row in result.mappings().all():
         result_data = row.get("result", {})
+        if isinstance(result_data, str):
+            result_data = json.loads(result_data)
         entries.append(
             TriageHistoryEntry(
                 id=row["id"],
@@ -542,30 +671,65 @@ async def triage_history(limit: int = Query(default=50, ge=1, le=200)) -> list[T
 
 
 @app.post("/api/books", response_model=Book, status_code=201, tags=["books"])
-async def create_book(payload: BookCreatePayload) -> Book:
-    db = _db_or_503()
-
+async def create_book(
+    payload: BookCreatePayload,
+    session: AsyncSession = Depends(get_db),
+) -> Book:
     insert_data = payload.model_dump(exclude_none=False, mode="json")
     insert_data.pop("id", None)
 
     # Remove None values for cleaner inserts (let DB defaults apply)
-    insert_data = {k: v for k, v in insert_data.items() if v is not None or k in (
-        "isbn", "subtitle", "author_birth_year", "author_death_year",
-        "publish_year", "page_count", "description", "public_domain_reason",
-        "gutenberg_id", "gutenberg_url", "openlibrary_id", "openlibrary_url",
-        "pre_llm_era", "triage_notes", "physical_location", "acquisition_cost",
-        "acquisition_date", "acquisition_source", "genre",
-    )}
+    nullable_keys = {
+        "isbn",
+        "subtitle",
+        "author_birth_year",
+        "author_death_year",
+        "publish_year",
+        "page_count",
+        "description",
+        "public_domain_reason",
+        "gutenberg_id",
+        "gutenberg_url",
+        "openlibrary_id",
+        "openlibrary_url",
+        "pre_llm_era",
+        "triage_notes",
+        "physical_location",
+        "acquisition_cost",
+        "acquisition_date",
+        "acquisition_source",
+        "genre",
+    }
+    insert_data = {
+        k: v
+        for k, v in insert_data.items()
+        if v is not None or k in nullable_keys
+    }
+
+    columns = ", ".join(insert_data.keys())
+    placeholders = ", ".join(f":{k}" for k in insert_data.keys())
 
     try:
-        resp = db.table("books").insert(insert_data).execute()
+        result = await session.execute(
+            text(
+                f"INSERT INTO books ({columns}) VALUES ({placeholders}) "
+                "RETURNING *"
+            ),
+            insert_data,
+        )
+        await session.commit()
     except Exception as exc:
-        raise HTTPException(status_code=409, detail=f"Failed to create book: {exc}") from exc
+        raise HTTPException(
+            status_code=409, detail=f"Failed to create book: {exc}"
+        ) from exc
 
-    if not resp.data:
-        raise HTTPException(status_code=500, detail="Book creation returned no data.")
+    row = result.mappings().first()
+    if not row:
+        raise HTTPException(
+            status_code=500, detail="Book creation returned no data."
+        )
 
-    return _coerce_book(resp.data[0])
+    return _coerce_book(dict(row))
 
 
 @app.get("/api/books", response_model=PaginatedBooks, tags=["books"])
@@ -579,82 +743,121 @@ async def list_books(
     scan_status: str | None = Query(default=None),
     sale_status: str | None = Query(default=None),
     sort: BookSort = Query(default=BookSort.newest),
+    session: AsyncSession = Depends(get_db),
 ) -> PaginatedBooks:
-    db = _db_or_503()
+    conditions: list[str] = []
+    params: dict[str, Any] = {}
 
-    query = db.table("books").select("*", count="exact")
-
-    # Full-text search via ilike on title + author
+    # Full-text search via ilike on title + author + isbn
     if search:
-        query = query.or_(f"title.ilike.%{search}%,author_name.ilike.%{search}%,isbn.ilike.%{search}%")
+        conditions.append(
+            "(title ILIKE :search OR author_name ILIKE :search "
+            "OR isbn ILIKE :search)"
+        )
+        params["search"] = f"%{search}%"
 
     # Multi-value filters (comma-separated)
     if public_domain_status:
         values = [v.strip() for v in public_domain_status.split(",") if v.strip()]
         if values:
-            query = query.in_("public_domain_status", values)
+            conditions.append("public_domain_status = ANY(:pd_values)")
+            params["pd_values"] = values
 
     if ai_training_value:
         values = [v.strip() for v in ai_training_value.split(",") if v.strip()]
         if values:
-            query = query.in_("ai_training_value", values)
+            conditions.append("ai_training_value = ANY(:ai_values)")
+            params["ai_values"] = values
 
     if triage_action:
         values = [v.strip() for v in triage_action.split(",") if v.strip()]
         if values:
-            query = query.in_("triage_action", values)
+            conditions.append("triage_action = ANY(:ta_values)")
+            params["ta_values"] = values
 
     if scan_status:
         values = [v.strip() for v in scan_status.split(",") if v.strip()]
         if values:
-            query = query.in_("scan_status", values)
+            conditions.append("scan_status = ANY(:ss_values)")
+            params["ss_values"] = values
 
     if sale_status:
         values = [v.strip() for v in sale_status.split(",") if v.strip()]
         if values:
-            query = query.in_("resale_status", values)
+            conditions.append("resale_status = ANY(:rs_values)")
+            params["rs_values"] = values
+
+    where_clause = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+
+    # Count query
+    count_result = await session.execute(
+        text(f"SELECT count(*) FROM books {where_clause}"),
+        params,
+    )
+    total = count_result.scalar_one()
 
     # Sorting
-    sort_map: dict[str, tuple[str, bool]] = {
-        "newest": ("created_at", True),
-        "score_desc": ("triage_score", True),
-        "title_asc": ("title", False),
-        "author_asc": ("author_name", False),
-        "year_asc": ("publish_year", False),
-        "year_desc": ("publish_year", True),
+    sort_map: dict[str, tuple[str, str]] = {
+        "newest": ("created_at", "DESC"),
+        "score_desc": ("triage_score", "DESC"),
+        "title_asc": ("title", "ASC"),
+        "author_asc": ("author_name", "ASC"),
+        "year_asc": ("publish_year", "ASC"),
+        "year_desc": ("publish_year", "DESC"),
     }
-    sort_col, sort_desc = sort_map.get(sort.value, ("created_at", True))
-    query = query.order(sort_col, desc=sort_desc)
+    sort_col, sort_dir = sort_map.get(sort.value, ("created_at", "DESC"))
+    order_clause = f"ORDER BY {sort_col} {sort_dir}"
 
     # Pagination
     offset = (page - 1) * limit
-    query = query.range(offset, offset + limit - 1)
+    params["offset"] = offset
+    params["lim"] = limit
 
-    resp = query.execute()
-    total = resp.count or 0
-    items = [_coerce_book(row) for row in (resp.data or [])]
+    data_result = await session.execute(
+        text(
+            f"SELECT * FROM books {where_clause} "
+            f"{order_clause} OFFSET :offset LIMIT :lim"
+        ),
+        params,
+    )
+    items = [_coerce_book(dict(r)) for r in data_result.mappings().all()]
     pages = max(1, (total + limit - 1) // limit)
 
-    return PaginatedBooks(items=items, total=total, page=page, limit=limit, pages=pages)
+    return PaginatedBooks(
+        items=items, total=total, page=page, limit=limit, pages=pages
+    )
 
 
 @app.get("/api/books/{book_id}", response_model=Book, tags=["books"])
-async def get_book(book_id: str) -> Book:
-    db = _db_or_503()
-    resp = db.table("books").select("*").eq("id", book_id).execute()
-    row = _row_or_404(resp.data, "Book", book_id)
-    return _coerce_book(row)
+async def get_book(
+    book_id: str,
+    session: AsyncSession = Depends(get_db),
+) -> Book:
+    result = await session.execute(
+        text("SELECT * FROM books WHERE id = :id"), {"id": book_id}
+    )
+    row = result.mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail=f"Book {book_id} not found")
+    return _coerce_book(dict(row))
 
 
 @app.patch("/api/books/{book_id}", response_model=Book, tags=["books"])
-async def update_book(book_id: str, payload: BookUpdatePayload) -> Book:
-    db = _db_or_503()
-
+async def update_book(
+    book_id: str,
+    payload: BookUpdatePayload,
+    session: AsyncSession = Depends(get_db),
+) -> Book:
     # Verify book exists
-    existing = db.table("books").select("id").eq("id", book_id).execute()
-    _row_or_404(existing.data, "Book", book_id)
+    existing = await session.execute(
+        text("SELECT id FROM books WHERE id = :id"), {"id": book_id}
+    )
+    if not existing.mappings().first():
+        raise HTTPException(status_code=404, detail=f"Book {book_id} not found")
 
-    update_data = {k: v for k, v in payload.model_dump(mode="json").items() if v is not None}
+    update_data = {
+        k: v for k, v in payload.model_dump(mode="json").items() if v is not None
+    }
     if not update_data:
         raise HTTPException(status_code=422, detail="No update fields provided.")
 
@@ -663,30 +866,55 @@ async def update_book(book_id: str, payload: BookUpdatePayload) -> Book:
         if hasattr(val, "value"):
             update_data[key] = val.value
 
-    resp = db.table("books").update(update_data).eq("id", book_id).execute()
-    row = _row_or_404(resp.data, "Book", book_id)
-    return _coerce_book(row)
+    set_clause = ", ".join(f"{k} = :{k}" for k in update_data.keys())
+    update_data["id"] = book_id
+
+    result = await session.execute(
+        text(f"UPDATE books SET {set_clause} WHERE id = :id RETURNING *"),
+        update_data,
+    )
+    await session.commit()
+    row = result.mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail=f"Book {book_id} not found")
+    return _coerce_book(dict(row))
 
 
 @app.delete("/api/books/{book_id}", tags=["books"])
-async def delete_book(book_id: str) -> dict[str, bool]:
-    db = _db_or_503()
-    existing = db.table("books").select("id").eq("id", book_id).execute()
-    _row_or_404(existing.data, "Book", book_id)
-    db.table("books").delete().eq("id", book_id).execute()
+async def delete_book(
+    book_id: str,
+    session: AsyncSession = Depends(get_db),
+) -> dict[str, bool]:
+    existing = await session.execute(
+        text("SELECT id FROM books WHERE id = :id"), {"id": book_id}
+    )
+    if not existing.mappings().first():
+        raise HTTPException(status_code=404, detail=f"Book {book_id} not found")
+    await session.execute(
+        text("DELETE FROM books WHERE id = :id"), {"id": book_id}
+    )
+    await session.commit()
     return {"deleted": True}
 
 
-@app.post("/api/books/{book_id}/rerun-triage", response_model=Book, tags=["books"])
-async def rerun_triage(book_id: str) -> Book:
-    db = _db_or_503()
-    resp = db.table("books").select("*").eq("id", book_id).execute()
-    row = _row_or_404(resp.data, "Book", book_id)
-    book = _coerce_book(row)
+@app.post(
+    "/api/books/{book_id}/rerun-triage", response_model=Book, tags=["books"]
+)
+async def rerun_triage(
+    book_id: str,
+    session: AsyncSession = Depends(get_db),
+) -> Book:
+    result = await session.execute(
+        text("SELECT * FROM books WHERE id = :id"), {"id": book_id}
+    )
+    row = result.mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail=f"Book {book_id} not found")
+    book = _coerce_book(dict(row))
 
     triage_result = await _run_triage(book.isbn, book.title, book.author_name)
 
-    update_data: dict[str, Any] = {
+    update_params: dict[str, Any] = {
         "public_domain_status": triage_result.public_domain_status.value,
         "public_domain_reason": triage_result.public_domain_reason,
         "public_domain_checked_at": _now_iso(),
@@ -699,20 +927,59 @@ async def rerun_triage(book_id: str) -> Book:
         "already_digitised": triage_result.already_digitised,
         "gutenberg_id": triage_result.gutenberg_id,
         "gutenberg_url": triage_result.gutenberg_url,
+        "id": book_id,
     }
+
+    set_parts = [
+        "public_domain_status = :public_domain_status",
+        "public_domain_reason = :public_domain_reason",
+        "public_domain_checked_at = :public_domain_checked_at",
+        "ai_training_value = :ai_training_value",
+        "ai_value_factors = :ai_value_factors",
+        "pre_llm_era = :pre_llm_era",
+        "triage_action = :triage_action",
+        "triage_score = :triage_score",
+        "triage_run_at = :triage_run_at",
+        "already_digitised = :already_digitised",
+        "gutenberg_id = :gutenberg_id",
+        "gutenberg_url = :gutenberg_url",
+    ]
+
     if triage_result.author_death_year and not book.author_death_year:
-        update_data["author_death_year"] = triage_result.author_death_year
+        update_params["author_death_year"] = triage_result.author_death_year
+        set_parts.append("author_death_year = :author_death_year")
 
-    update_resp = db.table("books").update(update_data).eq("id", book_id).execute()
-    row2 = _row_or_404(update_resp.data, "Book", book_id)
-    return _coerce_book(row2)
+    set_clause = ", ".join(set_parts)
+    update_result = await session.execute(
+        text(f"UPDATE books SET {set_clause} WHERE id = :id RETURNING *"),
+        update_params,
+    )
+    await session.commit()
+    row2 = update_result.mappings().first()
+    if not row2:
+        raise HTTPException(status_code=404, detail=f"Book {book_id} not found")
+    return _coerce_book(dict(row2))
 
 
-@app.get("/api/books/{book_id}/resale", response_model=ResaleRecommendation, tags=["books"])
-async def get_resale_recommendation(book_id: str) -> ResaleRecommendation:
-    db = _db_or_503()
-    resp = db.table("books").select("public_domain_status,ai_training_value,already_digitised").eq("id", book_id).execute()
-    row = _row_or_404(resp.data, "Book", book_id)
+@app.get(
+    "/api/books/{book_id}/resale",
+    response_model=ResaleRecommendation,
+    tags=["books"],
+)
+async def get_resale_recommendation(
+    book_id: str,
+    session: AsyncSession = Depends(get_db),
+) -> ResaleRecommendation:
+    result = await session.execute(
+        text(
+            "SELECT public_domain_status, ai_training_value, already_digitised "
+            "FROM books WHERE id = :id"
+        ),
+        {"id": book_id},
+    )
+    row = result.mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail=f"Book {book_id} not found")
 
     rec = triage_logic.recommend_resale_platform(
         row.get("public_domain_status", "unknown"),
@@ -727,21 +994,36 @@ async def get_resale_recommendation(book_id: str) -> ResaleRecommendation:
 # ---------------------------------------------------------------------------
 
 
-@app.post("/api/scan/queue/{book_id}", response_model=ScanStatusResponse, tags=["scan"])
-async def queue_scan(book_id: str) -> ScanStatusResponse:
-    db = _db_or_503()
-    existing = db.table("books").select("id,scan_status,scan_method").eq("id", book_id).execute()
-    _row_or_404(existing.data, "Book", book_id)
+@app.post(
+    "/api/scan/queue/{book_id}",
+    response_model=ScanStatusResponse,
+    tags=["scan"],
+)
+async def queue_scan(
+    book_id: str,
+    session: AsyncSession = Depends(get_db),
+) -> ScanStatusResponse:
+    existing = await session.execute(
+        text("SELECT id, scan_status, scan_method FROM books WHERE id = :id"),
+        {"id": book_id},
+    )
+    row = existing.mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail=f"Book {book_id} not found")
 
-    db.table("books").update({
-        "scan_status": "queued",
-        "scan_started_at": _now_iso(),
-    }).eq("id", book_id).execute()
+    await session.execute(
+        text(
+            "UPDATE books SET scan_status = 'queued', "
+            "scan_started_at = :now WHERE id = :id"
+        ),
+        {"now": _now_iso(), "id": book_id},
+    )
+    await session.commit()
 
     return ScanStatusResponse(
         book_id=book_id,
         scan_status="queued",  # type: ignore[arg-type]
-        scan_method=existing.data[0].get("scan_method"),
+        scan_method=row.get("scan_method"),
         pages_uploaded=0,
         pages_ocr_complete=0,
         pages_reviewed=0,
@@ -758,96 +1040,146 @@ async def upload_scan_page(
     book_id: str = Form(...),
     page_number: int = Form(...),
     image_file: UploadFile = File(...),
+    session: AsyncSession = Depends(get_db),
 ) -> ScanPage:
-    db = _db_or_503()
-
     # Verify book exists
-    existing = db.table("books").select("id").eq("id", book_id).execute()
-    _row_or_404(existing.data, "Book", book_id)
+    existing = await session.execute(
+        text("SELECT id FROM books WHERE id = :id"), {"id": book_id}
+    )
+    if not existing.mappings().first():
+        raise HTTPException(status_code=404, detail=f"Book {book_id} not found")
 
-    if not image_file.content_type or not image_file.content_type.startswith("image/"):
-        raise HTTPException(status_code=422, detail="Uploaded file must be an image.")
+    if not image_file.content_type or not image_file.content_type.startswith(
+        "image/"
+    ):
+        raise HTTPException(
+            status_code=422, detail="Uploaded file must be an image."
+        )
 
     image_bytes = await image_file.read()
     ext = (image_file.filename or "page.jpg").rsplit(".", 1)[-1].lower()
     image_path = f"{book_id}/{page_number:04d}.{ext}"
 
-    # Upload to Supabase Storage
+    # Write to local filesystem storage
     try:
-        db.storage.from_("scan-pages").upload(
-            image_path,
-            image_bytes,
-            {"content-type": image_file.content_type or "image/jpeg", "upsert": "true"},
-        )
+        storage_file = _storage_path("scan-pages", image_path)
+        storage_file.write_bytes(image_bytes)
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Storage upload failed: {exc}") from exc
+        raise HTTPException(
+            status_code=500, detail=f"Storage write failed: {exc}"
+        ) from exc
 
-    # Get public URL (or signed URL)
-    try:
-        url_data = db.storage.from_("scan-pages").get_public_url(image_path)
-        image_url: str | None = url_data if isinstance(url_data, str) else None
-    except Exception:
-        image_url = None
+    image_url = str(_storage_path("scan-pages", image_path))
 
     # Upsert scan_pages row
-    page_row: dict[str, Any] = {
-        "book_id": book_id,
-        "page_number": page_number,
-        "image_path": image_path,
-        "image_url": image_url,
-    }
-    resp = (
-        db.table("scan_pages")
-        .upsert(page_row, on_conflict="book_id,page_number")
-        .execute()
+    result = await session.execute(
+        text(
+            "INSERT INTO scan_pages (book_id, page_number, image_path, image_url) "
+            "VALUES (:book_id, :page_number, :image_path, :image_url) "
+            "ON CONFLICT (book_id, page_number) "
+            "DO UPDATE SET image_path = :image_path, image_url = :image_url "
+            "RETURNING *"
+        ),
+        {
+            "book_id": book_id,
+            "page_number": page_number,
+            "image_path": image_path,
+            "image_url": image_url,
+        },
     )
-    if not resp.data:
-        raise HTTPException(status_code=500, detail="Failed to save scan page record.")
+    await session.commit()
+    row = result.mappings().first()
+    if not row:
+        raise HTTPException(
+            status_code=500, detail="Failed to save scan page record."
+        )
 
     # Update book scan_status to 'scanning' if still queued
-    db.table("books").update({"scan_status": "scanning"}).eq("id", book_id).eq("scan_status", "queued").execute()
+    await session.execute(
+        text(
+            "UPDATE books SET scan_status = 'scanning' "
+            "WHERE id = :id AND scan_status = 'queued'"
+        ),
+        {"id": book_id},
+    )
+    await session.commit()
 
-    return ScanPage(**resp.data[0])
+    return ScanPage(**dict(row))
 
 
 @app.post("/api/scan/process/{book_id}", tags=["scan"])
-async def process_scan(book_id: str, background_tasks: BackgroundTasks) -> dict[str, Any]:
-    db = _db_or_503()
-    existing = db.table("books").select("id").eq("id", book_id).execute()
-    _row_or_404(existing.data, "Book", book_id)
+async def process_scan(
+    book_id: str,
+    background_tasks: BackgroundTasks,
+    session: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    existing = await session.execute(
+        text("SELECT id FROM books WHERE id = :id"), {"id": book_id}
+    )
+    if not existing.mappings().first():
+        raise HTTPException(status_code=404, detail=f"Book {book_id} not found")
 
-    pages_resp = db.table("scan_pages").select("id", count="exact").eq("book_id", book_id).execute()
-    n_pages = pages_resp.count or 0
+    pages_count = (
+        await session.execute(
+            text(
+                "SELECT count(*) FROM scan_pages WHERE book_id = :book_id"
+            ),
+            {"book_id": book_id},
+        )
+    ).scalar_one()
 
-    if n_pages == 0:
-        raise HTTPException(status_code=422, detail="No scan pages uploaded for this book.")
+    if pages_count == 0:
+        raise HTTPException(
+            status_code=422,
+            detail="No scan pages uploaded for this book.",
+        )
 
     background_tasks.add_task(ocr_pipeline.run_ocr_pipeline, book_id)
 
-    return {"queued": True, "pages": n_pages}
+    return {"queued": True, "pages": pages_count}
 
 
-@app.get("/api/scan/status/{book_id}", response_model=ScanStatusResponse, tags=["scan"])
-async def get_scan_status(book_id: str) -> ScanStatusResponse:
-    db = _db_or_503()
+@app.get(
+    "/api/scan/status/{book_id}",
+    response_model=ScanStatusResponse,
+    tags=["scan"],
+)
+async def get_scan_status(
+    book_id: str,
+    session: AsyncSession = Depends(get_db),
+) -> ScanStatusResponse:
+    book_result = await session.execute(
+        text(
+            "SELECT id, scan_status, scan_method, ocr_quality_score, "
+            "ocr_word_count, ocr_page_count, ocr_text_path "
+            "FROM books WHERE id = :id"
+        ),
+        {"id": book_id},
+    )
+    book_row = book_result.mappings().first()
+    if not book_row:
+        raise HTTPException(status_code=404, detail=f"Book {book_id} not found")
 
-    book_resp = db.table("books").select(
-        "id,scan_status,scan_method,ocr_quality_score,ocr_word_count,ocr_page_count,ocr_text_path"
-    ).eq("id", book_id).execute()
-    book_row = _row_or_404(book_resp.data, "Book", book_id)
-
-    pages_resp = db.table("scan_pages").select("id,ocr_text,reviewed").eq("book_id", book_id).execute()
-    pages = pages_resp.data or []
+    pages_result = await session.execute(
+        text(
+            "SELECT id, ocr_text, reviewed FROM scan_pages "
+            "WHERE book_id = :book_id"
+        ),
+        {"book_id": book_id},
+    )
+    pages = pages_result.mappings().all()
     pages_uploaded = len(pages)
     pages_ocr_complete = sum(1 for p in pages if p.get("ocr_text"))
     pages_reviewed = sum(1 for p in pages if p.get("reviewed"))
 
-    progress_pct = (pages_ocr_complete / pages_uploaded * 100.0) if pages_uploaded > 0 else 0.0
+    progress_pct = (
+        (pages_ocr_complete / pages_uploaded * 100.0) if pages_uploaded > 0 else 0.0
+    )
 
-    # Text preview from storage
+    # Text preview from local storage
     text_preview: str | None = None
     if book_row.get("ocr_text_path"):
-        full_text = ocr_pipeline.get_text_from_storage(db, book_row["ocr_text_path"])
+        full_text = ocr_pipeline.get_text_from_storage(book_row["ocr_text_path"])
         if full_text:
             words = full_text.split()[:100]
             text_preview = " ".join(words)
@@ -867,39 +1199,71 @@ async def get_scan_status(book_id: str) -> ScanStatusResponse:
     )
 
 
-@app.get("/api/scan/text/{book_id}", response_class=PlainTextResponse, tags=["scan"])
-async def get_scan_text(book_id: str) -> str:
-    db = _db_or_503()
-    book_resp = db.table("books").select("ocr_text_path,title").eq("id", book_id).execute()
-    book_row = _row_or_404(book_resp.data, "Book", book_id)
+@app.get(
+    "/api/scan/text/{book_id}",
+    response_class=PlainTextResponse,
+    tags=["scan"],
+)
+async def get_scan_text(
+    book_id: str,
+    session: AsyncSession = Depends(get_db),
+) -> str:
+    book_result = await session.execute(
+        text("SELECT ocr_text_path, title FROM books WHERE id = :id"),
+        {"id": book_id},
+    )
+    book_row = book_result.mappings().first()
+    if not book_row:
+        raise HTTPException(status_code=404, detail=f"Book {book_id} not found")
 
     ocr_path = book_row.get("ocr_text_path")
     if not ocr_path:
-        raise HTTPException(status_code=404, detail="No OCR text available for this book.")
+        raise HTTPException(
+            status_code=404, detail="No OCR text available for this book."
+        )
 
-    text = ocr_pipeline.get_text_from_storage(db, ocr_path)
-    if text is None:
-        raise HTTPException(status_code=404, detail="OCR text file not found in storage.")
+    scan_text = ocr_pipeline.get_text_from_storage(ocr_path)
+    if scan_text is None:
+        raise HTTPException(
+            status_code=404, detail="OCR text file not found in storage."
+        )
 
-    return text
+    return scan_text
 
 
-@app.patch("/api/scan/review/{book_id}", response_model=ScanStatusResponse, tags=["scan"])
-async def review_scan(book_id: str, payload: ScanReviewPayload) -> ScanStatusResponse:
-    db = _db_or_503()
-    existing = db.table("books").select("id").eq("id", book_id).execute()
-    _row_or_404(existing.data, "Book", book_id)
+@app.patch(
+    "/api/scan/review/{book_id}",
+    response_model=ScanStatusResponse,
+    tags=["scan"],
+)
+async def review_scan(
+    book_id: str,
+    payload: ScanReviewPayload,
+    session: AsyncSession = Depends(get_db),
+) -> ScanStatusResponse:
+    existing = await session.execute(
+        text("SELECT id FROM books WHERE id = :id"), {"id": book_id}
+    )
+    if not existing.mappings().first():
+        raise HTTPException(status_code=404, detail=f"Book {book_id} not found")
 
-    update: dict[str, Any] = {}
+    set_parts: list[str] = []
+    params: dict[str, Any] = {"id": book_id}
     if payload.ocr_quality_score is not None:
-        update["ocr_quality_score"] = payload.ocr_quality_score
+        set_parts.append("ocr_quality_score = :ocr_quality_score")
+        params["ocr_quality_score"] = payload.ocr_quality_score
     if payload.reviewed is True:
-        update["scan_status"] = "reviewed"
+        set_parts.append("scan_status = 'reviewed'")
 
-    if update:
-        db.table("books").update(update).eq("id", book_id).execute()
+    if set_parts:
+        set_clause = ", ".join(set_parts)
+        await session.execute(
+            text(f"UPDATE books SET {set_clause} WHERE id = :id"),
+            params,
+        )
+        await session.commit()
 
-    return await get_scan_status(book_id)
+    return await get_scan_status(book_id, session)
 
 
 # ---------------------------------------------------------------------------
@@ -907,23 +1271,35 @@ async def review_scan(book_id: str, payload: ScanReviewPayload) -> ScanStatusRes
 # ---------------------------------------------------------------------------
 
 
-def _build_dataset_text_path(book_id: str, dataset_id: str) -> str:
-    return f"datasets/{book_id}/{dataset_id}.txt"
-
-
-@app.post("/api/datasets", response_model=Dataset, status_code=201, tags=["datasets"])
-async def create_dataset(payload: DatasetCreatePayload) -> Dataset:
-    db = _db_or_503()
-
+@app.post(
+    "/api/datasets", response_model=Dataset, status_code=201, tags=["datasets"]
+)
+async def create_dataset(
+    payload: DatasetCreatePayload,
+    session: AsyncSession = Depends(get_db),
+) -> Dataset:
     # Verify book exists and has OCR text
-    book_resp = db.table("books").select("id,ocr_text_path,ocr_quality_score,ocr_word_count,ocr_page_count,title").eq("id", payload.book_id).execute()
-    book_row = _row_or_404(book_resp.data, "Book", payload.book_id)
+    book_result = await session.execute(
+        text(
+            "SELECT id, ocr_text_path, ocr_quality_score, ocr_word_count, "
+            "ocr_page_count, title FROM books WHERE id = :id"
+        ),
+        {"id": payload.book_id},
+    )
+    book_row = book_result.mappings().first()
+    if not book_row:
+        raise HTTPException(
+            status_code=404, detail=f"Book {payload.book_id} not found"
+        )
 
     if not book_row.get("ocr_text_path"):
-        raise HTTPException(status_code=422, detail="Book has no OCR text. Run OCR pipeline first.")
+        raise HTTPException(
+            status_code=422,
+            detail="Book has no OCR text. Run OCR pipeline first.",
+        )
 
     # Fetch full text and generate preview
-    full_text = ocr_pipeline.get_text_from_storage(db, book_row["ocr_text_path"])
+    full_text = ocr_pipeline.get_text_from_storage(book_row["ocr_text_path"])
     text_preview: str | None = None
     if full_text:
         words = full_text.split()
@@ -938,29 +1314,42 @@ async def create_dataset(payload: DatasetCreatePayload) -> Dataset:
         "pipeline": "bookscan-ocr-v1",
     }
 
-    # The text_file_path points at the OCR output; create a stable path
     text_file_path = book_row["ocr_text_path"]
 
-    insert_row: dict[str, Any] = {
-        "book_id": payload.book_id,
-        "title": payload.title,
-        "description": payload.description,
-        "domain_tags": payload.domain_tags,
-        "language": payload.language,
-        "word_count": book_row.get("ocr_word_count"),
-        "page_count": book_row.get("ocr_page_count"),
-        "text_file_path": text_file_path,
-        "text_preview": text_preview,
-        "ocr_quality_score": book_row.get("ocr_quality_score"),
-        "provenance_document": provenance,
-        "asking_price": payload.asking_price,
-    }
+    result = await session.execute(
+        text(
+            "INSERT INTO datasets "
+            "(book_id, title, description, domain_tags, language, word_count, "
+            "page_count, text_file_path, text_preview, ocr_quality_score, "
+            "provenance_document, asking_price) "
+            "VALUES (:book_id, :title, :description, :domain_tags, :language, "
+            ":word_count, :page_count, :text_file_path, :text_preview, "
+            ":ocr_quality_score, :provenance_document, :asking_price) "
+            "RETURNING *"
+        ),
+        {
+            "book_id": payload.book_id,
+            "title": payload.title,
+            "description": payload.description,
+            "domain_tags": payload.domain_tags,
+            "language": payload.language,
+            "word_count": book_row.get("ocr_word_count"),
+            "page_count": book_row.get("ocr_page_count"),
+            "text_file_path": text_file_path,
+            "text_preview": text_preview,
+            "ocr_quality_score": book_row.get("ocr_quality_score"),
+            "provenance_document": json.dumps(provenance),
+            "asking_price": payload.asking_price,
+        },
+    )
+    await session.commit()
+    row = result.mappings().first()
+    if not row:
+        raise HTTPException(
+            status_code=500, detail="Dataset creation returned no data."
+        )
 
-    resp = db.table("datasets").insert(insert_row).execute()
-    if not resp.data:
-        raise HTTPException(status_code=500, detail="Dataset creation returned no data.")
-
-    return Dataset(**resp.data[0])
+    return Dataset(**dict(row))
 
 
 @app.get("/api/datasets", response_model=list[Dataset], tags=["datasets"])
@@ -968,20 +1357,31 @@ async def list_datasets(
     domain: str | None = Query(default=None),
     language: str | None = Query(default=None),
     sale_status: str | None = Query(default=None),
+    session: AsyncSession = Depends(get_db),
 ) -> list[Dataset]:
-    db = _db_or_503()
-    query = db.table("datasets").select("*").order("created_at", desc=True)
+    conditions: list[str] = []
+    params: dict[str, Any] = {}
 
     if language:
-        query = query.eq("language", language)
+        conditions.append("language = :language")
+        params["language"] = language
 
     if sale_status:
         values = [v.strip() for v in sale_status.split(",") if v.strip()]
         if values:
-            query = query.in_("sale_status", values)
+            conditions.append("sale_status = ANY(:ss_values)")
+            params["ss_values"] = values
 
-    resp = query.execute()
-    rows = resp.data or []
+    where_clause = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+
+    result = await session.execute(
+        text(
+            f"SELECT * FROM datasets {where_clause} "
+            "ORDER BY created_at DESC"
+        ),
+        params,
+    )
+    rows = [dict(r) for r in result.mappings().all()]
 
     # Domain filter (array contains)
     if domain:
@@ -990,21 +1390,43 @@ async def list_datasets(
     return [Dataset(**row) for row in rows]
 
 
-@app.get("/api/datasets/{dataset_id}", response_model=Dataset, tags=["datasets"])
-async def get_dataset(dataset_id: str) -> Dataset:
-    db = _db_or_503()
-    resp = db.table("datasets").select("*").eq("id", dataset_id).execute()
-    row = _row_or_404(resp.data, "Dataset", dataset_id)
-    return Dataset(**row)
+@app.get(
+    "/api/datasets/{dataset_id}", response_model=Dataset, tags=["datasets"]
+)
+async def get_dataset(
+    dataset_id: str,
+    session: AsyncSession = Depends(get_db),
+) -> Dataset:
+    result = await session.execute(
+        text("SELECT * FROM datasets WHERE id = :id"), {"id": dataset_id}
+    )
+    row = result.mappings().first()
+    if not row:
+        raise HTTPException(
+            status_code=404, detail=f"Dataset {dataset_id} not found"
+        )
+    return Dataset(**dict(row))
 
 
-@app.patch("/api/datasets/{dataset_id}", response_model=Dataset, tags=["datasets"])
-async def update_dataset(dataset_id: str, payload: DatasetUpdatePayload) -> Dataset:
-    db = _db_or_503()
-    existing = db.table("datasets").select("id").eq("id", dataset_id).execute()
-    _row_or_404(existing.data, "Dataset", dataset_id)
+@app.patch(
+    "/api/datasets/{dataset_id}", response_model=Dataset, tags=["datasets"]
+)
+async def update_dataset(
+    dataset_id: str,
+    payload: DatasetUpdatePayload,
+    session: AsyncSession = Depends(get_db),
+) -> Dataset:
+    existing = await session.execute(
+        text("SELECT id FROM datasets WHERE id = :id"), {"id": dataset_id}
+    )
+    if not existing.mappings().first():
+        raise HTTPException(
+            status_code=404, detail=f"Dataset {dataset_id} not found"
+        )
 
-    update_data = {k: v for k, v in payload.model_dump(mode="json").items() if v is not None}
+    update_data = {
+        k: v for k, v in payload.model_dump(mode="json").items() if v is not None
+    }
     if not update_data:
         raise HTTPException(status_code=422, detail="No update fields provided.")
 
@@ -1014,64 +1436,125 @@ async def update_dataset(dataset_id: str, payload: DatasetUpdatePayload) -> Data
     if update_data.get("sale_status") == "sold" and "sold_at" not in update_data:
         update_data["sold_at"] = _now_iso()
 
-    resp = db.table("datasets").update(update_data).eq("id", dataset_id).execute()
-    row = _row_or_404(resp.data, "Dataset", dataset_id)
-    return Dataset(**row)
+    set_clause = ", ".join(f"{k} = :{k}" for k in update_data.keys())
+    update_data["id"] = dataset_id
+
+    result = await session.execute(
+        text(f"UPDATE datasets SET {set_clause} WHERE id = :id RETURNING *"),
+        update_data,
+    )
+    await session.commit()
+    row = result.mappings().first()
+    if not row:
+        raise HTTPException(
+            status_code=404, detail=f"Dataset {dataset_id} not found"
+        )
+    return Dataset(**dict(row))
 
 
 @app.delete("/api/datasets/{dataset_id}", tags=["datasets"])
-async def delete_dataset(dataset_id: str) -> dict[str, bool]:
-    db = _db_or_503()
-    existing = db.table("datasets").select("id").eq("id", dataset_id).execute()
-    _row_or_404(existing.data, "Dataset", dataset_id)
-    db.table("datasets").delete().eq("id", dataset_id).execute()
+async def delete_dataset(
+    dataset_id: str,
+    session: AsyncSession = Depends(get_db),
+) -> dict[str, bool]:
+    existing = await session.execute(
+        text("SELECT id FROM datasets WHERE id = :id"), {"id": dataset_id}
+    )
+    if not existing.mappings().first():
+        raise HTTPException(
+            status_code=404, detail=f"Dataset {dataset_id} not found"
+        )
+    await session.execute(
+        text("DELETE FROM datasets WHERE id = :id"), {"id": dataset_id}
+    )
+    await session.commit()
     return {"deleted": True}
 
 
 @app.get("/api/datasets/{dataset_id}/preview", tags=["datasets"])
-async def get_dataset_preview(dataset_id: str) -> dict[str, Any]:
-    db = _db_or_503()
-    resp = db.table("datasets").select("text_file_path,text_preview,word_count").eq("id", dataset_id).execute()
-    row = _row_or_404(resp.data, "Dataset", dataset_id)
+async def get_dataset_preview(
+    dataset_id: str,
+    session: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    result = await session.execute(
+        text(
+            "SELECT text_file_path, text_preview, word_count "
+            "FROM datasets WHERE id = :id"
+        ),
+        {"id": dataset_id},
+    )
+    row = result.mappings().first()
+    if not row:
+        raise HTTPException(
+            status_code=404, detail=f"Dataset {dataset_id} not found"
+        )
 
     # Return cached preview if available
     if row.get("text_preview"):
         words = row["text_preview"].split()
-        return {"preview": " ".join(words[:500]), "word_count": row.get("word_count") or 0}
+        return {
+            "preview": " ".join(words[:500]),
+            "word_count": row.get("word_count") or 0,
+        }
 
     # Load from storage
-    text = ocr_pipeline.get_text_from_storage(db, row["text_file_path"])
-    if not text:
-        raise HTTPException(status_code=404, detail="Dataset text file not found in storage.")
+    preview_text = ocr_pipeline.get_text_from_storage(row["text_file_path"])
+    if not preview_text:
+        raise HTTPException(
+            status_code=404,
+            detail="Dataset text file not found in storage.",
+        )
 
-    words = text.split()
+    words = preview_text.split()
     return {"preview": " ".join(words[:500]), "word_count": len(words)}
 
 
-@app.get("/api/datasets/{dataset_id}/download", response_class=PlainTextResponse, tags=["datasets"])
-async def download_dataset(dataset_id: str) -> str:
-    db = _db_or_503()
-    resp = db.table("datasets").select("text_file_path,title").eq("id", dataset_id).execute()
-    row = _row_or_404(resp.data, "Dataset", dataset_id)
+@app.get(
+    "/api/datasets/{dataset_id}/download",
+    response_class=PlainTextResponse,
+    tags=["datasets"],
+)
+async def download_dataset(
+    dataset_id: str,
+    session: AsyncSession = Depends(get_db),
+) -> str:
+    result = await session.execute(
+        text("SELECT text_file_path, title FROM datasets WHERE id = :id"),
+        {"id": dataset_id},
+    )
+    row = result.mappings().first()
+    if not row:
+        raise HTTPException(
+            status_code=404, detail=f"Dataset {dataset_id} not found"
+        )
 
-    text = ocr_pipeline.get_text_from_storage(db, row["text_file_path"])
-    if not text:
-        raise HTTPException(status_code=404, detail="Dataset text file not found in storage.")
+    download_text = ocr_pipeline.get_text_from_storage(row["text_file_path"])
+    if not download_text:
+        raise HTTPException(
+            status_code=404,
+            detail="Dataset text file not found in storage.",
+        )
 
-    return text
+    return download_text
 
 
 # ---------------------------------------------------------------------------
-# Sales — register /revenue/summary BEFORE /{sale_id}
+# Sales -- register /revenue/summary BEFORE /{sale_id}
 # ---------------------------------------------------------------------------
 
 
-@app.get("/api/sales/revenue/summary", response_model=RevenueSummary, tags=["sales"])
-async def get_revenue_summary() -> RevenueSummary:
-    db = _db_or_503()
-
-    sold_resp = db.table("sales").select("*").eq("status", "sold").execute()
-    sales = sold_resp.data or []
+@app.get(
+    "/api/sales/revenue/summary",
+    response_model=RevenueSummary,
+    tags=["sales"],
+)
+async def get_revenue_summary(
+    session: AsyncSession = Depends(get_db),
+) -> RevenueSummary:
+    sold_result = await session.execute(
+        text("SELECT * FROM sales WHERE status = 'sold'")
+    )
+    sales = [dict(r) for r in sold_result.mappings().all()]
 
     data_revenue = 0.0
     physical_revenue = 0.0
@@ -1093,7 +1576,9 @@ async def get_revenue_summary() -> RevenueSummary:
         month_key = ts[:7] if len(ts) >= 7 else "unknown"
         if month_key not in monthly:
             monthly[month_key] = {"data_revenue": 0.0, "physical_revenue": 0.0}
-        monthly[month_key]["data_revenue" if sale_type == "data" else "physical_revenue"] += amount
+        monthly[month_key][
+            "data_revenue" if sale_type == "data" else "physical_revenue"
+        ] += amount
 
         # Platform aggregation
         if platform not in platform_totals:
@@ -1130,7 +1615,11 @@ async def get_revenue_summary() -> RevenueSummary:
             revenue=round(v["revenue"], 2),
             count=v["count"],
         )
-        for plat, v in sorted(platform_totals.items(), key=lambda x: x[1]["revenue"], reverse=True)
+        for plat, v in sorted(
+            platform_totals.items(),
+            key=lambda x: x[1]["revenue"],
+            reverse=True,
+        )
     ]
 
     return RevenueSummary(
@@ -1143,29 +1632,48 @@ async def get_revenue_summary() -> RevenueSummary:
 
 
 @app.post("/api/sales", response_model=Sale, status_code=201, tags=["sales"])
-async def create_sale(payload: SaleCreatePayload) -> Sale:
-    db = _db_or_503()
-
-    insert_data = {k: v for k, v in payload.model_dump(mode="json").items() if v is not None}
+async def create_sale(
+    payload: SaleCreatePayload,
+    session: AsyncSession = Depends(get_db),
+) -> Sale:
+    insert_data = {
+        k: v for k, v in payload.model_dump(mode="json").items() if v is not None
+    }
 
     if insert_data.get("status") == "listed":
         insert_data.setdefault("listed_at", _now_iso())
     if insert_data.get("status") == "sold":
         insert_data.setdefault("sold_at", _now_iso())
 
-    resp = db.table("sales").insert(insert_data).execute()
-    if not resp.data:
-        raise HTTPException(status_code=500, detail="Sale creation returned no data.")
+    columns = ", ".join(insert_data.keys())
+    placeholders = ", ".join(f":{k}" for k in insert_data.keys())
 
-    sale_row = resp.data[0]
+    result = await session.execute(
+        text(
+            f"INSERT INTO sales ({columns}) VALUES ({placeholders}) RETURNING *"
+        ),
+        insert_data,
+    )
+    await session.commit()
+    sale_row = result.mappings().first()
+    if not sale_row:
+        raise HTTPException(
+            status_code=500, detail="Sale creation returned no data."
+        )
+
+    sale_dict = dict(sale_row)
 
     # Denormalise book title
-    if sale_row.get("book_id"):
-        book_resp = db.table("books").select("title").eq("id", sale_row["book_id"]).execute()
-        if book_resp.data:
-            sale_row["book_title"] = book_resp.data[0]["title"]
+    if sale_dict.get("book_id"):
+        book_result = await session.execute(
+            text("SELECT title FROM books WHERE id = :id"),
+            {"id": sale_dict["book_id"]},
+        )
+        book_row = book_result.mappings().first()
+        if book_row:
+            sale_dict["book_title"] = book_row["title"]
 
-    return Sale(**sale_row)
+    return Sale(**sale_dict)
 
 
 @app.get("/api/sales", response_model=list[Sale], tags=["sales"])
@@ -1174,57 +1682,98 @@ async def list_sales(
     platform: str | None = Query(default=None),
     date_from: str | None = Query(default=None),
     date_to: str | None = Query(default=None),
+    session: AsyncSession = Depends(get_db),
 ) -> list[Sale]:
-    db = _db_or_503()
-    query = db.table("sales").select("*").order("created_at", desc=True)
+    conditions: list[str] = []
+    params: dict[str, Any] = {}
 
     if sale_type:
-        query = query.eq("sale_type", sale_type)
+        conditions.append("sale_type = :sale_type")
+        params["sale_type"] = sale_type
     if platform:
-        query = query.eq("platform", platform)
+        conditions.append("platform = :platform")
+        params["platform"] = platform
     if date_from:
-        query = query.gte("created_at", date_from)
+        conditions.append("created_at >= :date_from")
+        params["date_from"] = date_from
     if date_to:
-        query = query.lte("created_at", date_to)
+        conditions.append("created_at <= :date_to")
+        params["date_to"] = date_to
 
-    resp = query.execute()
+    where_clause = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+
+    result = await session.execute(
+        text(
+            f"SELECT * FROM sales {where_clause} ORDER BY created_at DESC"
+        ),
+        params,
+    )
+
     sales: list[Sale] = []
-    for row in resp.data or []:
-        if row.get("book_id"):
+    for row in result.mappings().all():
+        sale_dict = dict(row)
+        if sale_dict.get("book_id"):
             try:
-                br = db.table("books").select("title").eq("id", row["book_id"]).execute()
-                if br.data:
-                    row["book_title"] = br.data[0]["title"]
+                br = await session.execute(
+                    text("SELECT title FROM books WHERE id = :id"),
+                    {"id": sale_dict["book_id"]},
+                )
+                book_row = br.mappings().first()
+                if book_row:
+                    sale_dict["book_title"] = book_row["title"]
             except Exception:
                 pass
-        sales.append(Sale(**row))
+        sales.append(Sale(**sale_dict))
     return sales
 
 
 @app.get("/api/sales/{sale_id}", response_model=Sale, tags=["sales"])
-async def get_sale(sale_id: str) -> Sale:
-    db = _db_or_503()
-    resp = db.table("sales").select("*").eq("id", sale_id).execute()
-    row = _row_or_404(resp.data, "Sale", sale_id)
+async def get_sale(
+    sale_id: str,
+    session: AsyncSession = Depends(get_db),
+) -> Sale:
+    result = await session.execute(
+        text("SELECT * FROM sales WHERE id = :id"), {"id": sale_id}
+    )
+    row = result.mappings().first()
+    if not row:
+        raise HTTPException(
+            status_code=404, detail=f"Sale {sale_id} not found"
+        )
 
-    if row.get("book_id"):
+    sale_dict = dict(row)
+    if sale_dict.get("book_id"):
         try:
-            br = db.table("books").select("title").eq("id", row["book_id"]).execute()
-            if br.data:
-                row["book_title"] = br.data[0]["title"]
+            br = await session.execute(
+                text("SELECT title FROM books WHERE id = :id"),
+                {"id": sale_dict["book_id"]},
+            )
+            book_row = br.mappings().first()
+            if book_row:
+                sale_dict["book_title"] = book_row["title"]
         except Exception:
             pass
 
-    return Sale(**row)
+    return Sale(**sale_dict)
 
 
 @app.patch("/api/sales/{sale_id}", response_model=Sale, tags=["sales"])
-async def update_sale(sale_id: str, payload: SaleUpdatePayload) -> Sale:
-    db = _db_or_503()
-    existing = db.table("sales").select("id").eq("id", sale_id).execute()
-    _row_or_404(existing.data, "Sale", sale_id)
+async def update_sale(
+    sale_id: str,
+    payload: SaleUpdatePayload,
+    session: AsyncSession = Depends(get_db),
+) -> Sale:
+    existing = await session.execute(
+        text("SELECT id FROM sales WHERE id = :id"), {"id": sale_id}
+    )
+    if not existing.mappings().first():
+        raise HTTPException(
+            status_code=404, detail=f"Sale {sale_id} not found"
+        )
 
-    update_data = {k: v for k, v in payload.model_dump(mode="json").items() if v is not None}
+    update_data = {
+        k: v for k, v in payload.model_dump(mode="json").items() if v is not None
+    }
     if not update_data:
         raise HTTPException(status_code=422, detail="No update fields provided.")
 
@@ -1233,17 +1782,38 @@ async def update_sale(sale_id: str, payload: SaleUpdatePayload) -> Sale:
     if update_data.get("status") == "listed" and "listed_at" not in update_data:
         update_data["listed_at"] = _now_iso()
 
-    resp = db.table("sales").update(update_data).eq("id", sale_id).execute()
-    row = _row_or_404(resp.data, "Sale", sale_id)
-    return Sale(**row)
+    set_clause = ", ".join(f"{k} = :{k}" for k in update_data.keys())
+    update_data["id"] = sale_id
+
+    result = await session.execute(
+        text(f"UPDATE sales SET {set_clause} WHERE id = :id RETURNING *"),
+        update_data,
+    )
+    await session.commit()
+    row = result.mappings().first()
+    if not row:
+        raise HTTPException(
+            status_code=404, detail=f"Sale {sale_id} not found"
+        )
+    return Sale(**dict(row))
 
 
 @app.delete("/api/sales/{sale_id}", tags=["sales"])
-async def delete_sale(sale_id: str) -> dict[str, bool]:
-    db = _db_or_503()
-    existing = db.table("sales").select("id").eq("id", sale_id).execute()
-    _row_or_404(existing.data, "Sale", sale_id)
-    db.table("sales").delete().eq("id", sale_id).execute()
+async def delete_sale(
+    sale_id: str,
+    session: AsyncSession = Depends(get_db),
+) -> dict[str, bool]:
+    existing = await session.execute(
+        text("SELECT id FROM sales WHERE id = :id"), {"id": sale_id}
+    )
+    if not existing.mappings().first():
+        raise HTTPException(
+            status_code=404, detail=f"Sale {sale_id} not found"
+        )
+    await session.execute(
+        text("DELETE FROM sales WHERE id = :id"), {"id": sale_id}
+    )
+    await session.commit()
     return {"deleted": True}
 
 
@@ -1253,21 +1823,39 @@ async def delete_sale(sale_id: str) -> dict[str, bool]:
 
 
 @app.get("/api/export/inventory.csv", tags=["export"])
-async def export_inventory_csv() -> StreamingResponse:
-    db = _db_or_503()
-    resp = db.table("books").select("*").order("created_at", desc=True).execute()
-    rows = resp.data or []
+async def export_inventory_csv(
+    session: AsyncSession = Depends(get_db),
+) -> StreamingResponse:
+    result = await session.execute(
+        text("SELECT * FROM books ORDER BY created_at DESC")
+    )
+    rows = [dict(r) for r in result.mappings().all()]
 
     output = io.StringIO()
     if rows:
         fieldnames = [
-            "id", "isbn", "title", "author_name", "publish_year",
-            "public_domain_status", "ai_training_value", "triage_action",
-            "triage_score", "scan_status", "resale_status", "resale_price",
-            "acquisition_cost", "language", "page_count", "genre",
-            "condition", "created_at",
+            "id",
+            "isbn",
+            "title",
+            "author_name",
+            "publish_year",
+            "public_domain_status",
+            "ai_training_value",
+            "triage_action",
+            "triage_score",
+            "scan_status",
+            "resale_status",
+            "resale_price",
+            "acquisition_cost",
+            "language",
+            "page_count",
+            "genre",
+            "condition",
+            "created_at",
         ]
-        writer = csv.DictWriter(output, fieldnames=fieldnames, extrasaction="ignore")
+        writer = csv.DictWriter(
+            output, fieldnames=fieldnames, extrasaction="ignore"
+        )
         writer.writeheader()
         for row in rows:
             writer.writerow({k: row.get(k, "") for k in fieldnames})
@@ -1276,21 +1864,31 @@ async def export_inventory_csv() -> StreamingResponse:
     return StreamingResponse(
         iter([output.getvalue()]),
         media_type="text/csv",
-        headers={"Content-Disposition": "attachment; filename=bookscan-inventory.csv"},
+        headers={
+            "Content-Disposition": "attachment; filename=bookscan-inventory.csv"
+        },
     )
 
 
 @app.get("/api/export/books/{book_id}.json", tags=["export"])
-async def export_book_json(book_id: str) -> StreamingResponse:
-    db = _db_or_503()
-    resp = db.table("books").select("*").eq("id", book_id).execute()
-    row = _row_or_404(resp.data, "Book", book_id)
+async def export_book_json(
+    book_id: str,
+    session: AsyncSession = Depends(get_db),
+) -> StreamingResponse:
+    result = await session.execute(
+        text("SELECT * FROM books WHERE id = :id"), {"id": book_id}
+    )
+    row = result.mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail=f"Book {book_id} not found")
 
-    book = _coerce_book(row)
+    book = _coerce_book(dict(row))
     json_bytes = book.model_dump_json(indent=2).encode("utf-8")
 
     return StreamingResponse(
         iter([json_bytes]),
         media_type="application/json",
-        headers={"Content-Disposition": f"attachment; filename=book-{book_id}.json"},
+        headers={
+            "Content-Disposition": f"attachment; filename=book-{book_id}.json"
+        },
     )

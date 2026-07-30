@@ -26,11 +26,13 @@ services:
     healthCheckPath: /health
 
     envVars:
-      # Supabase — mark sync:false so Render does not expose values in logs.
-      - key: SUPABASE_URL
+      # Neon PostgreSQL — mark sync:false so Render does not expose values in logs.
+      - key: DATABASE_URL
         sync: false
-      - key: SUPABASE_SERVICE_KEY
-        sync: false
+
+      # Local storage directory for scan images and OCR text.
+      - key: STORAGE_DIR
+        value: "./storage"
 
       # CORS — comma-separated list of allowed frontend origins.
       # Example: https://bookscan.vercel.app,https://www.bookscan.io

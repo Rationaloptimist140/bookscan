@@ -1,4 +1,4 @@
-# 📚 BookScan
+# BookScan
 
 **Triage, scan and sell pre-2022 physical books as clean AI training data.**
 
@@ -61,13 +61,16 @@ Both revenue streams — dataset sales and physical resales — are tracked in o
 └────────────────────────────┘  only   └──────────────┬───────────────┘
                                                       │
                               ┌───────────────────────▼───────────────┐
-                              │  Supabase                             │
-                              │  PostgreSQL + Storage buckets         │
+                              │  Neon PostgreSQL (free tier)          │
+                              │  Standard PostgreSQL via asyncpg      │
                               └───────────────────────────────────────┘
                                               ▲
                               ┌───────────────┴───────────────────────┐
                               │  Open Library API  ·  Gutendex API    │
                               └───────────────────────────────────────┘
+
+  Scan images and OCR text are stored on the local filesystem
+  under a configurable STORAGE_DIR (default: ./storage).
 ```
 
 **Why the proxy route?** The browser only ever talks to the Next.js origin. The
@@ -82,7 +85,7 @@ shipped in the client bundle.
 |---|---|---|
 | Node.js | 18+ | 20 LTS recommended |
 | Python | 3.12+ | Backend uses modern type syntax (`X \| None`, `StrEnum`) |
-| Supabase account | — | Free tier is sufficient |
+| Neon account | — | Free tier is sufficient |
 | Tesseract OCR | 5+ | Only needed for the scanning workflow |
 
 Install Tesseract locally:
@@ -124,8 +127,8 @@ work for the duration of the session.
 
 ## Database setup
 
-1. Create a new project at [supabase.com](https://supabase.com).
-2. Open **SQL Editor** → **New query**.
+1. Create a free project at [neon.tech](https://neon.tech).
+2. Open the **SQL Editor** in the Neon dashboard (or connect via `psql`).
 3. Paste the entire contents of [`db/schema.sql`](db/schema.sql) and run it.
 
 This creates:
@@ -133,16 +136,15 @@ This creates:
 - Tables: `books`, `scan_pages`, `datasets`, `sales`, `triage_cache`, `api_logs`
 - All indexes (including GIN full-text and trigram indexes on title/author)
 - `updated_at` triggers on `books` and `datasets`
-- Row Level Security enabled on every table, with permissive single-user policies
-- Storage buckets `scan-pages` and `ocr-text`
 - A `v_monthly_revenue` helper view and a `purge_expired_triage_cache()` function
 
-4. Under **Project Settings → API**, copy your project URL and **service role** key
-   for the backend.
+4. Go to **Connection Details** in the Neon dashboard and copy the **connection string**.
+   It will look like:
+   ```
+   postgresql://user:password@ep-xxxxx.region.neon.tech/neondb?sslmode=require
+   ```
 
-> **Tighten RLS before going multi-tenant.** The shipped policies are
-> `USING (true) WITH CHECK (true)` — correct for a single-user tool, not for shared
-> use. Swap them for `auth.uid() = owner_id` checks when you add accounts.
+> Neon is standard PostgreSQL — the same `schema.sql` runs without modification.
 
 ---
 
@@ -155,16 +157,16 @@ source .venv/bin/activate        # Windows PowerShell: .venv\Scripts\Activate.ps
 pip install -r requirements.txt
 
 cp .env.template .env
-# Edit .env and fill in SUPABASE_URL and SUPABASE_SERVICE_KEY
+# Edit .env and set DATABASE_URL to your Neon connection string
 
 uvicorn main:app --reload --port 8000
 ```
 
 Interactive API docs: <http://localhost:8000/docs>
 
-The app is designed to **boot successfully even without Supabase credentials** so it
+The app is designed to **boot successfully even without database credentials** so it
 can start on a fresh host before secrets are configured. In that state `/health`
-returns `supabase_configured: false` and database-backed routes return HTTP 503.
+returns `db_configured: false` and database-backed routes return HTTP 503.
 
 ---
 
@@ -210,16 +212,16 @@ npm run build      # production build
 
 | Variable | Required | Purpose |
 |---|---|---|
-| `SUPABASE_URL` | yes | Supabase project URL |
-| `SUPABASE_SERVICE_KEY` | yes | Service role key — **server side only** |
+| `DATABASE_URL` | yes | Neon PostgreSQL connection string |
+| `STORAGE_DIR` | no | Local directory for scan images and OCR text (default `./storage`) |
 | `ALLOWED_ORIGINS` | no | Comma-separated CORS origins (default `*`) |
 | `API_KEY` | no | If set, requests must send a matching `X-API-Key` |
 | `TESSERACT_CMD` | no | Explicit path to the Tesseract binary |
 | `OCR_LANGUAGE` | no | Tesseract language code (default `eng`) |
 
 > **Never commit real secrets.** `.env` and `.env.local` are git-ignored; only the
-> `.template` / `.example` files are tracked. The service role key bypasses RLS —
-> keep it server-side and rotate it if it is ever exposed.
+> `.template` / `.example` files are tracked. The DATABASE_URL contains credentials —
+> keep it server-side and rotate the Neon password if it is ever exposed.
 
 ---
 
@@ -239,8 +241,8 @@ npm run build      # production build
 The repo includes [`backend/render.yaml`](backend/render.yaml) as a Blueprint.
 
 1. In Render, **New** → **Blueprint** and point it at the repository.
-2. Confirm the service, then add the secret env vars (`SUPABASE_URL`,
-   `SUPABASE_SERVICE_KEY`) in the dashboard — they are declared `sync: false`.
+2. Confirm the service, then add the secret env var (`DATABASE_URL`)
+   in the dashboard — it is declared `sync: false`.
 3. Deploy.
 
 Manual setup instead of the Blueprint:
@@ -269,7 +271,7 @@ Base URL: your backend origin. All responses are JSON unless noted.
 
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/` · `/health` | Health check, reports `supabase_configured` |
+| `GET` | `/` · `/health` | Health check, reports `db_configured` |
 | `GET` | `/api/stats/summary` | Dashboard totals, revenue and net profit |
 | `GET` | `/api/stats/triage-distribution` | Book counts grouped by triage action |
 | `GET` | `/api/activity` | Recent activity feed (`?limit=`) |
@@ -449,7 +451,7 @@ bookscan/
 ├── backend/
 │   ├── main.py                 FastAPI app — all endpoints
 │   ├── models.py               Pydantic v2 models
-│   ├── database.py             Supabase client
+│   ├── database.py             SQLAlchemy async + asyncpg
 │   ├── triage_logic.py         Pure business logic
 │   ├── external_apis.py        Open Library + Gutendex
 │   ├── ocr_pipeline.py         Tesseract OCR pipeline
@@ -458,7 +460,7 @@ bookscan/
 │   └── .env.template
 │
 └── db/
-    └── schema.sql              Complete schema, indexes, triggers, RLS
+    └── schema.sql              Complete schema, indexes, triggers
 ```
 
 `lib/types.ts` is the contract of record: the backend's Pydantic models in

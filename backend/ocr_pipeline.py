@@ -1,6 +1,6 @@
 """
 BookScan — OCR pipeline.
-Pillow preprocessing → pytesseract → clean_ocr_text → Supabase Storage upload.
+Pillow preprocessing -> pytesseract -> clean_ocr_text -> local filesystem storage.
 Runs as a FastAPI BackgroundTask.
 pytesseract and PIL are imported lazily so the app boots on hosts without
 Tesseract installed; a clear error is surfaced if they are unavailable.
@@ -11,10 +11,24 @@ from __future__ import annotations
 import io
 import logging
 import os
-from collections.abc import AsyncIterator
+from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Storage directory (configurable via env var, default ./storage)
+# ---------------------------------------------------------------------------
+
+STORAGE_DIR = os.environ.get("STORAGE_DIR", "./storage")
+
+
+def _storage_path(*parts: str) -> Path:
+    """Build an absolute path under STORAGE_DIR and ensure parent dirs exist."""
+    p = Path(STORAGE_DIR).joinpath(*parts)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    return p
+
 
 # ---------------------------------------------------------------------------
 # Entry point (called from main.py as BackgroundTasks.add_task)
@@ -25,9 +39,9 @@ async def run_ocr_pipeline(book_id: str) -> None:
     """
     Main OCR entry point designed to be swapped for a job queue later.
     1. Fetch scan_pages rows for the book.
-    2. Download each image from Supabase Storage.
+    2. Read each image from local filesystem storage.
     3. Preprocess + OCR each page.
-    4. Combine, clean, upload text.
+    4. Combine, clean, write text to local storage.
     5. Update books row with results.
     """
     try:
@@ -39,9 +53,18 @@ async def run_ocr_pipeline(book_id: str) -> None:
             import database
 
             if database.is_configured():
-                database.get_client().table("books").update(
-                    {"scan_status": "scanned"}  # fall back to last safe status
-                ).eq("id", book_id).execute()
+                from sqlalchemy import text as sa_text
+
+                async for session in database.get_session():
+                    await session.execute(
+                        sa_text(
+                            "UPDATE books SET scan_status = 'scanned' "
+                            "WHERE id = :book_id"
+                        ),
+                        {"book_id": book_id},
+                    )
+                    await session.commit()
+                    break
         except Exception:
             pass
 
@@ -59,103 +82,142 @@ async def _execute_pipeline(book_id: str) -> None:
         ) from exc
 
     import database
+    from sqlalchemy import text as sa_text
     from triage_logic import clean_ocr_text
 
     if not database.is_configured():
-        raise RuntimeError("Supabase is not configured; cannot run OCR pipeline.")
+        raise RuntimeError("Database is not configured; cannot run OCR pipeline.")
 
-    db = database.get_client()
+    async for session in database.get_session():
+        # Mark as scanning
+        await session.execute(
+            sa_text("UPDATE books SET scan_status = 'scanning' WHERE id = :book_id"),
+            {"book_id": book_id},
+        )
+        await session.commit()
 
-    # Mark as scanning
-    db.table("books").update({"scan_status": "scanning"}).eq("id", book_id).execute()
+        # Fetch page records in order
+        result = await session.execute(
+            sa_text(
+                "SELECT * FROM scan_pages "
+                "WHERE book_id = :book_id ORDER BY page_number"
+            ),
+            {"book_id": book_id},
+        )
+        pages: list[dict[str, Any]] = [dict(r) for r in result.mappings().all()]
 
-    # Fetch page records in order
-    pages_resp = (
-        db.table("scan_pages")
-        .select("*")
-        .eq("book_id", book_id)
-        .order("page_number")
-        .execute()
-    )
-    pages: list[dict[str, Any]] = pages_resp.data or []
+        if not pages:
+            logger.warning("No scan_pages found for book %s", book_id)
+            await session.execute(
+                sa_text(
+                    "UPDATE books SET scan_status = 'not_scanned' WHERE id = :book_id"
+                ),
+                {"book_id": book_id},
+            )
+            await session.commit()
+            return
 
-    if not pages:
-        logger.warning("No scan_pages found for book %s", book_id)
-        db.table("books").update({"scan_status": "not_scanned"}).eq("id", book_id).execute()
-        return
+        page_texts: list[str] = []
+        page_confidences: list[float] = []
 
-    page_texts: list[str] = []
-    page_confidences: list[float] = []
+        for page in pages:
+            page_id = page["id"]
+            image_path = page["image_path"]
 
-    for page in pages:
-        page_id = page["id"]
-        image_path = page["image_path"]
+            try:
+                # Read image bytes from local filesystem storage
+                image_bytes = _read_image(image_path)
+                if image_bytes is None:
+                    logger.warning("Could not read image for page %s", page_id)
+                    continue
 
-        try:
-            # Download image bytes from Supabase Storage
-            image_bytes = _download_image(db, image_path)
-            if image_bytes is None:
-                logger.warning("Could not download image for page %s", page_id)
-                continue
+                # Preprocess
+                pil_image = _preprocess_image(image_bytes, Image, ImageFilter, ImageOps)
 
-            # Preprocess
-            pil_image = _preprocess_image(image_bytes, Image, ImageFilter, ImageOps)
+                # OCR
+                raw_text: str = pytesseract.image_to_string(pil_image, lang="eng")
 
-            # OCR
-            raw_text: str = pytesseract.image_to_string(pil_image, lang="eng")
+                # Confidence via image_to_data
+                confidence = _calculate_confidence(pil_image, pytesseract)
 
-            # Confidence via image_to_data
-            confidence = _calculate_confidence(pil_image, pytesseract)
+                page_texts.append(raw_text)
+                page_confidences.append(confidence)
 
-            page_texts.append(raw_text)
-            page_confidences.append(confidence)
+                # Update scan_page row
+                await session.execute(
+                    sa_text(
+                        "UPDATE scan_pages "
+                        "SET ocr_text = :ocr_text, ocr_confidence = :ocr_confidence "
+                        "WHERE id = :page_id"
+                    ),
+                    {
+                        "ocr_text": raw_text,
+                        "ocr_confidence": round(confidence, 2),
+                        "page_id": page_id,
+                    },
+                )
+                await session.commit()
 
-            # Update scan_page row
-            db.table("scan_pages").update(
-                {
-                    "ocr_text": raw_text,
-                    "ocr_confidence": round(confidence, 2),
-                }
-            ).eq("id", page_id).execute()
+            except Exception as exc:
+                logger.warning("OCR failed for page %s: %s", page_id, exc)
 
-        except Exception as exc:
-            logger.warning("OCR failed for page %s: %s", page_id, exc)
+        if not page_texts:
+            logger.warning("No pages successfully OCR'd for book %s", book_id)
+            await session.execute(
+                sa_text(
+                    "UPDATE books SET scan_status = 'scanned' WHERE id = :book_id"
+                ),
+                {"book_id": book_id},
+            )
+            await session.commit()
+            return
 
-    if not page_texts:
-        logger.warning("No pages successfully OCR'd for book %s", book_id)
-        db.table("books").update({"scan_status": "scanned"}).eq("id", book_id).execute()
-        return
+        # Combine and clean
+        combined_raw = "\n\n".join(page_texts)
+        clean_text = clean_ocr_text(combined_raw)
 
-    # Combine and clean
-    combined_raw = "\n\n".join(page_texts)
-    clean_text = clean_ocr_text(combined_raw)
+        word_count = len(clean_text.split())
+        avg_confidence = (
+            sum(page_confidences) / len(page_confidences)
+            if page_confidences
+            else 0.0
+        )
+        quality_score = round(avg_confidence / 100.0, 2)  # normalise 0-1
 
-    word_count = len(clean_text.split())
-    avg_confidence = sum(page_confidences) / len(page_confidences) if page_confidences else 0.0
-    quality_score = round(avg_confidence / 100.0, 2)  # normalise 0–1
+        # Write to local filesystem storage under "ocr-text"
+        text_path = f"{book_id}.txt"
+        text_bytes = clean_text.encode("utf-8")
+        upload_success = _write_text(text_path, text_bytes)
 
-    # Upload to Supabase Storage bucket "ocr-text"
-    text_path = f"{book_id}.txt"
-    text_bytes = clean_text.encode("utf-8")
-    upload_success = _upload_text(db, text_path, text_bytes)
+        # Update books row
+        await session.execute(
+            sa_text(
+                "UPDATE books SET "
+                "scan_status = 'ocr_complete', "
+                "ocr_text_path = :ocr_text_path, "
+                "ocr_quality_score = :ocr_quality_score, "
+                "ocr_word_count = :ocr_word_count, "
+                "ocr_page_count = :ocr_page_count "
+                "WHERE id = :book_id"
+            ),
+            {
+                "ocr_text_path": text_path if upload_success else None,
+                "ocr_quality_score": quality_score,
+                "ocr_word_count": word_count,
+                "ocr_page_count": len(page_texts),
+                "book_id": book_id,
+            },
+        )
+        await session.commit()
 
-    # Update books row
-    update_data: dict[str, Any] = {
-        "scan_status": "ocr_complete",
-        "ocr_text_path": text_path if upload_success else None,
-        "ocr_quality_score": quality_score,
-        "ocr_word_count": word_count,
-        "ocr_page_count": len(page_texts),
-    }
-    db.table("books").update(update_data).eq("id", book_id).execute()
-
-    logger.info(
-        "OCR complete for book %s: %d pages, %d words, quality=%.2f",
-        book_id,
-        len(page_texts),
-        word_count,
-        quality_score,
-    )
+        logger.info(
+            "OCR complete for book %s: %d pages, %d words, quality=%.2f",
+            book_id,
+            len(page_texts),
+            word_count,
+            quality_score,
+        )
+        break  # only need one iteration of the generator
 
 
 # ---------------------------------------------------------------------------
@@ -199,8 +261,8 @@ def _preprocess_image(
 
 def _deskew(img: Any, Image: Any) -> Any:
     """
-    Estimate skew by checking small rotations (-3° to +3°) and returning the
-    rotation that minimises the variance of horizontal projection (row sums).
+    Estimate skew by checking small rotations (-3 to +3 degrees) and returning
+    the rotation that minimises the variance of horizontal projection (row sums).
     This is a lightweight approximation that handles typical book scans.
     """
     try:
@@ -211,7 +273,6 @@ def _deskew(img: Any, Image: Any) -> Any:
 
         for angle in [a * 0.5 for a in range(-6, 7)]:  # -3.0 to +3.0 in 0.5 steps
             rotated = img.rotate(angle, expand=False, fillcolor=255)
-            import struct
             pixels = list(rotated.getdata())
             width, height = rotated.size
             row_sums = [
@@ -238,12 +299,14 @@ def _deskew(img: Any, Image: Any) -> Any:
 def _calculate_confidence(img: Any, pytesseract: Any) -> float:
     """
     Use image_to_data to get per-word confidence scores.
-    Returns mean confidence (0–100) ignoring words with conf < 0.
+    Returns mean confidence (0-100) ignoring words with conf < 0.
     """
     try:
         import pandas as pd  # optional; use manual parsing as fallback
 
-        data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DATAFRAME)
+        data = pytesseract.image_to_data(
+            img, output_type=pytesseract.Output.DATAFRAME
+        )
         conf_values = data["conf"].dropna()
         conf_values = conf_values[conf_values >= 0]
         if conf_values.empty:
@@ -278,39 +341,38 @@ def _calculate_confidence(img: Any, pytesseract: Any) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Supabase Storage helpers
+# Local filesystem storage helpers
 # ---------------------------------------------------------------------------
 
 
-def _download_image(db: Any, image_path: str) -> bytes | None:
-    """Download an image from the scan-pages bucket."""
+def _read_image(image_path: str) -> bytes | None:
+    """Read an image from the scan-pages storage directory."""
     try:
-        response = db.storage.from_("scan-pages").download(image_path)
-        return response
+        full_path = _storage_path("scan-pages", image_path)
+        return full_path.read_bytes()
     except Exception as exc:
-        logger.warning("Failed to download image %s: %s", image_path, exc)
+        logger.warning("Failed to read image %s: %s", image_path, exc)
         return None
 
 
-def _upload_text(db: Any, path: str, content: bytes) -> bool:
-    """Upload cleaned text to the ocr-text bucket. Returns True on success."""
+def _write_text(path: str, content: bytes) -> bool:
+    """Write cleaned text to the ocr-text storage directory. Returns True on success."""
     try:
-        db.storage.from_("ocr-text").upload(
-            path,
-            content,
-            {"content-type": "text/plain; charset=utf-8", "upsert": "true"},
-        )
+        full_path = _storage_path("ocr-text", path)
+        full_path.write_bytes(content)
         return True
     except Exception as exc:
-        logger.warning("Failed to upload OCR text %s: %s", path, exc)
+        logger.warning("Failed to write OCR text %s: %s", path, exc)
         return False
 
 
-def get_text_from_storage(db: Any, text_path: str) -> str | None:
-    """Download and decode OCR text from storage. Returns None on failure."""
+def get_text_from_storage(text_path: str) -> str | None:
+    """Read and decode OCR text from local storage. Returns None on failure."""
     try:
-        raw: bytes = db.storage.from_("ocr-text").download(text_path)
-        return raw.decode("utf-8")
+        full_path = Path(STORAGE_DIR) / "ocr-text" / text_path
+        if not full_path.exists():
+            return None
+        return full_path.read_text(encoding="utf-8")
     except Exception as exc:
-        logger.warning("Failed to download OCR text %s: %s", text_path, exc)
+        logger.warning("Failed to read OCR text %s: %s", text_path, exc)
         return None

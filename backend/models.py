@@ -644,4 +644,4 @@ class HealthResponse(BaseModel):
 
     status: str
     version: str
-    supabase_configured: bool
+    db_configured: bool
